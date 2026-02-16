@@ -1,0 +1,27 @@
+# Ignore everything by default
+*
+
+# But allow these directories (need to unignore the dir first, then files inside)
+!/src/
+/src/*
+!/src/*.py
+
+!/test_experment_end_to_end/
+/test_experment_end_to_end/*
+!/test_experment_end_to_end/*.py
+
+!/unit_tests/
+/unit_tests/*
+!/unit_tests/*.py
+
+!/docs/
+/docs/*
+!/docs/*.md
+
+# Allow the .gitignore itself
+!.gitignore
+
+# Exclude __pycache__ everywhere (overrides any whitelist above)
+__pycache__/
+*.pyc
+*.pyo
