@@ -14,7 +14,9 @@ Key design principles:
 """
 
 import os
+import sys
 import json
+import time
 import multiprocessing as mp
 from multiprocessing import Pool
 from functools import partial
@@ -28,6 +30,10 @@ from deap import gp, base, creator, tools
 # Import types - these don't have global state
 from .gp_types import Image, Channel, FeatureVector, Prediction, Batch
 from .gp_context import GPContext, ExecutionMode
+from .gp_logging import (
+    setup_worker_logging, get_logger, log_memory,
+    log_worker_exception, TimingContext,
+)
 
 
 def get_available_workers() -> int:
@@ -120,31 +126,42 @@ def _init_worker(X_train: np.ndarray, y_train: np.ndarray,
     """
     global _worker_context, _worker_data, _worker_pset
     
-    # Create fresh context for this worker
-    _worker_context = WorkerContext()
-    
-    # Store data reference (copy-on-write in most cases due to fork)
-    _worker_data = {
-        'X_train': X_train,
-        'y_train': y_train,
-        'X_val': X_val,
-        'y_val': y_val,
-        'X_test': X_test,
-        'y_test': y_test,
-        'batch_size': batch_size
-    }
-    
-    # Store pset context for compilation
-    _worker_pset = pset_context
-    
-    # Setup DEAP creator in this process if not already done
-    if not hasattr(creator, 'FitnessMax'):
-        creator.create("FitnessMax", base.Fitness, weights=(1.0,))
-    if not hasattr(creator, 'Individual'):
-        creator.create("Individual", gp.PrimitiveTree, fitness=creator.FitnessMax)
-    
     pid = os.getpid()
-    print(f"[WORKER {pid}] Initialized with batch_size={batch_size}")
+    setup_worker_logging(pid)
+    logger = get_logger(f"worker.{pid}")
+    
+    try:
+        # Create fresh context for this worker
+        _worker_context = WorkerContext()
+        
+        # Store data reference (copy-on-write in most cases due to fork)
+        _worker_data = {
+            'X_train': X_train,
+            'y_train': y_train,
+            'X_val': X_val,
+            'y_val': y_val,
+            'X_test': X_test,
+            'y_test': y_test,
+            'batch_size': batch_size
+        }
+        
+        # Store pset context for compilation
+        _worker_pset = pset_context
+        
+        # Setup DEAP creator in this process if not already done
+        if not hasattr(creator, 'FitnessMax'):
+            creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+        if not hasattr(creator, 'Individual'):
+            creator.create("Individual", gp.PrimitiveTree, fitness=creator.FitnessMax)
+        
+        logger.info("Worker initialised  |  batch_size=%d  |  "
+                    "X_train=%s  X_val=%s  X_test=%s",
+                    batch_size, X_train.shape, X_val.shape, X_test.shape)
+        log_memory(label=f"worker-{pid}-init", logger=logger)
+        
+    except Exception as exc:
+        logger.critical("Worker %d FAILED to initialise: %s", pid, exc, exc_info=True)
+        raise
 
 
 def _make_image_iterator_worker(X: np.ndarray, batch_size: int):
@@ -224,7 +241,8 @@ def _setup_worker_ops_context(worker_ctx: WorkerContext):
 
 
 def _evaluate_pipeline_worker(expr_str: str, X: np.ndarray, y: np.ndarray,
-                              mode: ExecutionMode, batch_size: int) -> Tuple[float, Optional[str]]:
+                              mode: ExecutionMode, batch_size: int,
+                              individual_idx: int = -1) -> Tuple[float, Optional[str]]:
     """
     Evaluate an individual on a dataset in worker process.
     Uses worker-local context.
@@ -235,6 +253,13 @@ def _evaluate_pipeline_worker(expr_str: str, X: np.ndarray, y: np.ndarray,
     global _worker_context, _worker_pset
     
     pid = os.getpid()
+    logger = get_logger(f"worker.{pid}")
+    phase = mode.value.upper()  # "TRAIN" / "EVAL"
+    
+    logger.debug("Pipeline %s start  |  ind=%d  |  X.shape=%s  |  expr=%.120s...",
+                 phase, individual_idx, X.shape, expr_str)
+    
+    t0 = time.time()
     
     try:
         # Compile the expression
@@ -263,17 +288,27 @@ def _evaluate_pipeline_worker(expr_str: str, X: np.ndarray, y: np.ndarray,
             preds.append(batch.data)
         
         if not preds:
-            return 0.0, f"No predictions produced (empty pipeline output)"
+            msg = f"No predictions produced (empty pipeline output)"
+            logger.warning("Pipeline %s empty  |  ind=%d  |  %s", phase, individual_idx, msg)
+            return 0.0, msg
         
         preds = np.vstack(preds)
         y_pred = np.argmax(preds, axis=1)
         acc = accuracy_score(y, y_pred)
+        
+        elapsed = time.time() - t0
+        logger.info("Pipeline %s done  |  ind=%d  |  acc=%.4f  |  %.2fs",
+                    phase, individual_idx, acc, elapsed)
+        
         return acc, None
         
     except Exception as e:
-        import traceback
-        error_msg = f"[WORKER {pid}] Evaluation failed: {type(e).__name__}: {e}\n{traceback.format_exc()}"
-        print(error_msg, file=sys.stderr)
+        elapsed = time.time() - t0
+        tb_str = log_worker_exception(
+            e, phase=phase, individual_idx=individual_idx, expr_str=expr_str
+        )
+        error_msg = (f"[WORKER {pid}] {phase} failed after {elapsed:.2f}s: "
+                     f"{type(e).__name__}: {e}\n{tb_str}")
         return 0.0, error_msg
 
 
@@ -287,6 +322,12 @@ def evaluate_individual_worker(task: EvaluationTask) -> EvaluationResult:
     global _worker_context, _worker_data
     
     pid = os.getpid()
+    logger = get_logger(f"worker.{pid}")
+    overall_start = time.time()
+    
+    logger.info("=== EVAL START  |  gen=%d  ind=%d  |  expr=%.120s...",
+                task.gen_num, task.individual_idx, task.individual_str)
+    log_memory(label=f"eval-start-ind{task.individual_idx}", logger=logger)
     
     try:
         # Reset worker context for this evaluation (fresh context per tree)
@@ -307,15 +348,18 @@ def evaluate_individual_worker(task: EvaluationTask) -> EvaluationResult:
         # 1. Train (fit models in the tree)
         train_acc, train_err = _evaluate_pipeline_worker(
             task.individual_str, X_train, y_train,
-            ExecutionMode.TRAIN, batch_size
+            ExecutionMode.TRAIN, batch_size,
+            individual_idx=task.individual_idx
         )
         if train_err:
             errors.append(f"TRAIN: {train_err}")
+        log_memory(label=f"post-train-ind{task.individual_idx}", logger=logger)
         
         # 2. Validation (for fitness)
         val_acc, val_err = _evaluate_pipeline_worker(
             task.individual_str, X_val, y_val,
-            ExecutionMode.EVAL, batch_size
+            ExecutionMode.EVAL, batch_size,
+            individual_idx=task.individual_idx
         )
         if val_err:
             errors.append(f"VAL: {val_err}")
@@ -323,7 +367,8 @@ def evaluate_individual_worker(task: EvaluationTask) -> EvaluationResult:
         # 3. Test (for reporting)
         test_acc, test_err = _evaluate_pipeline_worker(
             task.individual_str, X_test, y_test,
-            ExecutionMode.EVAL, batch_size
+            ExecutionMode.EVAL, batch_size,
+            individual_idx=task.individual_idx
         )
         if test_err:
             errors.append(f"TEST: {test_err}")
@@ -332,9 +377,13 @@ def evaluate_individual_worker(task: EvaluationTask) -> EvaluationResult:
         success = len(errors) == 0
         error_msg = "\n".join(errors) if errors else None
         
+        overall_elapsed = time.time() - overall_start
+        
         # Save individual results to filesystem (worker responsibility)
         if task.tree_output_dir:
             os.makedirs(task.tree_output_dir, exist_ok=True)
+            
+            mem_snap = log_memory(label=f"eval-end-ind{task.individual_idx}", logger=logger)
             
             stats = {
                 "generation": task.gen_num,
@@ -344,12 +393,25 @@ def evaluate_individual_worker(task: EvaluationTask) -> EvaluationResult:
                 "test_accuracy": float(test_acc),
                 "expression": task.individual_str,
                 "worker_pid": pid,
-                "error": error_msg  # Now we capture errors in the results
+                "wall_time_seconds": round(overall_elapsed, 2),
+                "memory_rss_mb": mem_snap.rss_mb if mem_snap else None,
+                "error": error_msg
             }
             
             results_path = os.path.join(task.tree_output_dir, "results.json")
             with open(results_path, "w") as f:
                 json.dump(stats, f, indent=4)
+        
+        if success:
+            logger.info("=== EVAL DONE   |  gen=%d  ind=%d  |  "
+                        "train=%.4f  val=%.4f  test=%.4f  |  %.2fs",
+                        task.gen_num, task.individual_idx,
+                        train_acc, val_acc, test_acc, overall_elapsed)
+        else:
+            logger.warning("=== EVAL DONE (with errors)  |  gen=%d  ind=%d  |  "
+                           "train=%.4f  val=%.4f  test=%.4f  |  %.2fs  |  errors=%d",
+                           task.gen_num, task.individual_idx,
+                           train_acc, val_acc, test_acc, overall_elapsed, len(errors))
         
         return EvaluationResult(
             individual_idx=task.individual_idx,
@@ -361,9 +423,14 @@ def evaluate_individual_worker(task: EvaluationTask) -> EvaluationResult:
         )
         
     except Exception as e:
-        import traceback
-        error_msg = f"[WORKER {pid}] Top-level error: {type(e).__name__}: {e}\n{traceback.format_exc()}"
-        print(error_msg, file=sys.stderr)
+        overall_elapsed = time.time() - overall_start
+        tb_str = log_worker_exception(
+            e, phase="TOP-LEVEL",
+            individual_idx=task.individual_idx,
+            expr_str=task.individual_str
+        )
+        error_msg = (f"[WORKER {pid}] Top-level error after {overall_elapsed:.2f}s: "
+                     f"{type(e).__name__}: {e}\n{tb_str}")
         return EvaluationResult(
             individual_idx=task.individual_idx,
             train_acc=0.0,
@@ -401,9 +468,10 @@ class ParallelEvaluator:
             pset_context: The primitive set context dictionary for compilation
             n_workers: Number of worker processes (default: auto-detect)
         """
+        self.logger = get_logger("evaluator")
         self.n_workers = n_workers if n_workers else get_available_workers()
         
-        print(f"[PARALLEL] Creating process pool with {self.n_workers} workers")
+        self.logger.info("Creating process pool with %d workers", self.n_workers)
         
         # Create pool with initializer
         self.pool = Pool(
@@ -414,6 +482,10 @@ class ParallelEvaluator:
         )
         
         self.batch_size = batch_size
+        
+        # Track worker PIDs for memory monitoring
+        self._worker_pids: List[int] = []
+        self.logger.info("Process pool created successfully")
     
     def evaluate_population(self, population: List, gen_num: int,
                            base_output_dir: str) -> List[EvaluationResult]:
@@ -443,19 +515,41 @@ class ParallelEvaluator:
             )
             tasks.append(task)
         
-        # Submit tasks and collect results
-        print(f"[PARALLEL] Submitting {len(tasks)} evaluation tasks...")
+        self.logger.info("Submitting %d evaluation tasks for gen %d", len(tasks), gen_num)
+        log_memory(label=f"pre-eval-gen{gen_num}", logger=self.logger)
+        
+        pop_start = time.time()
         
         # Use imap_unordered for better load balancing
         results_dict = {}
+        completed = 0
+        failed = 0
         for result in self.pool.imap_unordered(evaluate_individual_worker, tasks):
             results_dict[result.individual_idx] = result
+            completed += 1
+            
+            # Collect worker PIDs for memory monitoring
+            # (worker_pid is stored in the results.json by workers)
+            
             if result.success:
-                print(f"[PARALLEL] Tree {result.individual_idx}: "
-                      f"train={result.train_acc:.4f}, val={result.val_acc:.4f}, "
-                      f"test={result.test_acc:.4f}")
+                self.logger.info(
+                    "[%d/%d] Tree %d: train=%.4f  val=%.4f  test=%.4f",
+                    completed, len(tasks), result.individual_idx,
+                    result.train_acc, result.val_acc, result.test_acc)
             else:
-                print(f"[PARALLEL] Tree {result.individual_idx}: FAILED - {result.error_msg}")
+                failed += 1
+                self.logger.error(
+                    "[%d/%d] Tree %d: FAILED  |  %s",
+                    completed, len(tasks), result.individual_idx,
+                    (result.error_msg or "")[:300])
+        
+        pop_elapsed = time.time() - pop_start
+        
+        self.logger.info(
+            "Population eval complete  |  gen=%d  |  %d/%d succeeded  |  "
+            "%d failed  |  %.2fs total",
+            gen_num, completed - failed, completed, failed, pop_elapsed)
+        log_memory(label=f"post-eval-gen{gen_num}", logger=self.logger)
         
         # Return results in original order
         results = [results_dict[i] for i in range(len(population))]
@@ -490,22 +584,39 @@ class ParallelEvaluator:
             )
             tasks.append(task)
         
-        print(f"[PARALLEL] Submitting {len(tasks)} evaluation tasks...")
+        self.logger.info("Submitting %d partial evaluation tasks for gen %d",
+                         len(tasks), gen_num)
+        
+        partial_start = time.time()
         
         # Collect results
         results = []
+        failed = 0
         for result in self.pool.imap_unordered(evaluate_individual_worker, tasks):
             results.append(result)
             if result.success:
-                print(f"[PARALLEL] Tree {result.individual_idx}: "
-                      f"train={result.train_acc:.4f}, val={result.val_acc:.4f}, "
-                      f"test={result.test_acc:.4f}")
+                self.logger.info(
+                    "Tree %d: train=%.4f  val=%.4f  test=%.4f",
+                    result.individual_idx,
+                    result.train_acc, result.val_acc, result.test_acc)
+            else:
+                failed += 1
+                self.logger.error(
+                    "Tree %d: FAILED  |  %s",
+                    result.individual_idx,
+                    (result.error_msg or "")[:300])
+        
+        partial_elapsed = time.time() - partial_start
+        self.logger.info(
+            "Partial eval complete  |  gen=%d  |  %d tasks  |  %d failed  |  %.2fs",
+            gen_num, len(tasks), failed, partial_elapsed)
         
         return results
     
     def shutdown(self):
         """Clean up the process pool."""
-        print("[PARALLEL] Shutting down worker pool...")
+        self.logger.info("Shutting down worker pool...")
+        log_memory(label="pre-shutdown", logger=self.logger)
         self.pool.close()
         self.pool.join()
-        print("[PARALLEL] Pool shutdown complete")
+        self.logger.info("Pool shutdown complete")

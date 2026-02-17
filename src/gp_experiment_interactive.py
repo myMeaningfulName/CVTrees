@@ -36,6 +36,11 @@ from src.gp_parallel import (
     EvaluationResult, 
     get_available_workers
 )
+from src.gp_logging import (
+    setup_experiment_logging, get_logger, log_memory,
+    start_heartbeat, stop_heartbeat, log_exception,
+    TimingContext, get_system_memory_info,
+)
 
 
 class SExpressionParser:
@@ -263,6 +268,11 @@ class InteractiveExperimentRunner:
         else:
             os.makedirs(self.base_dir)
         
+        # Setup logging & heartbeat
+        log_file = setup_experiment_logging(experiment_name, output_dir)
+        self.logger = get_logger("interactive")
+        self.logger.info("InteractiveExperimentRunner created  |  experiment=%s", experiment_name)
+        
         self.X_train = None
         self.y_train = None
         self.X_val = None
@@ -291,6 +301,9 @@ class InteractiveExperimentRunner:
         self.X_test = X_test
         self.y_test = y_test
         self.batch_size = batch_size
+        self.logger.info("Data loaded  |  train=%s  val=%s  test=%s  |  batch_size=%d",
+                         X_train.shape, X_val.shape, X_test.shape, batch_size)
+        log_memory(label="after-data-load", logger=self.logger)
         
     def setup_gp(self, pset: gp.PrimitiveSetTyped):
         """
@@ -704,6 +717,9 @@ class InteractiveExperimentRunner:
         print(f"  Max Generations: {max_generations or 'unlimited'}")
         print(f"  Output Directory: {self.base_dir}")
         
+        # Start heartbeat (writes alive signal every 60s)
+        start_heartbeat(interval=60, log_dir=self.base_dir, include_memory=True)
+        
         # Create parallel evaluator
         self.evaluator = ParallelEvaluator(
             X_train=self.X_train,
@@ -761,15 +777,19 @@ class InteractiveExperimentRunner:
                     print(f"\n✓ Successfully parsed {len(population)} individuals")
                     break
                 
-                # Evaluate population
-                print(f"\n--- Evaluating Generation {gen_num} ({len(population)} individuals) ---")
                 start_time = time.time()
                 
-                results = self.evaluator.evaluate_population(population, gen_num, self.base_dir)
-                self._apply_results_to_population(population, results)
+                # Evaluate population
+                print(f"\n--- Evaluating Generation {gen_num} ({len(population)} individuals) ---")
+                self.logger.info("Evaluating generation %d  |  %d individuals",
+                                 gen_num, len(population))
+                
+                with TimingContext(f"Generation {gen_num} evaluation", self.logger):
+                    results = self.evaluator.evaluate_population(population, gen_num, self.base_dir)
+                    self._apply_results_to_population(population, results)
                 
                 gen_time = time.time() - start_time
-                print(f"Evaluation completed in {gen_time:.2f}s")
+                self.logger.info("Generation %d completed in %.2fs", gen_num, gen_time)
                 
                 # Save generation results
                 previous_results = self.save_generation(population, gen_num)
@@ -786,6 +806,7 @@ class InteractiveExperimentRunner:
             self.save_experiment_summary()
             
         finally:
+            stop_heartbeat()
             if self.evaluator:
                 self.evaluator.shutdown()
 

@@ -5,6 +5,7 @@ from . import gp_ops
 from . import gp_setup
 from . import gp_utils
 from . import gp_draw
+from . import gp_logging
 from . import gp_experiment
 from . import gp_parallel
 from . import gp_experiment_parallel

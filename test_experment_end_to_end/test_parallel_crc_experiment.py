@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src import gp_setup
 from src.gp_experiment_parallel import run_parallel_experiment
 from src.gp_parallel import get_available_workers
+from src.gp_logging import setup_experiment_logging, get_logger, log_memory
 
 # --- Configuration ---
 IMG_SIZE = 32
@@ -135,9 +136,15 @@ def main():
     print("Parallel CRC GP Experiment")
     print("=" * 60)
     
+    # --- Early logging setup so data-loading issues are captured too ---
+    setup_experiment_logging("test_parallel_crc_extended", output_dir="experiments")
+    logger = get_logger("main")
+    logger.info("Parallel CRC GP Experiment starting")
+    log_memory(label="startup", logger=logger)
+    
     # Print worker detection info
     n_workers = get_available_workers()
-    print(f"\nDetected {n_workers} available workers")
+    logger.info("Detected %d available workers", n_workers)
     
     # Check for SLURM environment
     slurm_job_id = os.environ.get("SLURM_JOB_ID")

@@ -26,6 +26,11 @@ from src.gp_parallel import (
     EvaluationResult, 
     get_available_workers
 )
+from src.gp_logging import (
+    setup_experiment_logging, get_logger, log_memory,
+    start_heartbeat, stop_heartbeat, log_exception,
+    TimingContext, get_system_memory_info,
+)
 
 
 class ParallelExperimentRunner:
@@ -66,6 +71,11 @@ class ParallelExperimentRunner:
         else:
             os.makedirs(self.base_dir)
         
+        # Setup logging & heartbeat
+        log_file = setup_experiment_logging(experiment_name, output_dir)
+        self.logger = get_logger("experiment")
+        self.logger.info("ParallelExperimentRunner created  |  experiment=%s", experiment_name)
+        
         self.X_train = None
         self.y_train = None
         self.X_val = None
@@ -93,6 +103,9 @@ class ParallelExperimentRunner:
         self.X_test = X_test
         self.y_test = y_test
         self.batch_size = batch_size
+        self.logger.info("Data loaded  |  train=%s  val=%s  test=%s  |  batch_size=%d",
+                         X_train.shape, X_val.shape, X_test.shape, batch_size)
+        log_memory(label="after-data-load", logger=self.logger)
         
     def setup_gp(self, pset, pop_size=20, generations=10, 
                  crossover_prob=0.5, mutation_prob=0.2, max_depth=10):
@@ -170,7 +183,7 @@ class ParallelExperimentRunner:
         gen_dir = os.path.join(self.base_dir, f"gen_{gen_num}")
         os.makedirs(gen_dir, exist_ok=True)
         
-        print(f"Saving Generation {gen_num} statistics...")
+        self.logger.info("Saving generation %d statistics...", gen_num)
         
         train_accuracies = []
         val_accuracies = []
@@ -251,12 +264,15 @@ class ParallelExperimentRunner:
         with open(os.path.join(gen_dir, "generation_summary.json"), "w") as f:
             json.dump(gen_summary, f, indent=4)
         
-        print(f"Gen {gen_num}: avg_val={gen_summary['avg_val_accuracy']:.4f}, "
-              f"max_val={gen_summary['max_val_accuracy']:.4f}")
+        self.logger.info("Gen %d: avg_val=%.4f  max_val=%.4f  avg_test=%.4f",
+                         gen_num, gen_summary['avg_val_accuracy'],
+                         gen_summary['max_val_accuracy'],
+                         gen_summary['avg_test_accuracy'])
+        log_memory(label=f"post-save-gen{gen_num}", logger=self.logger)
 
     def save_experiment_summary(self):
         """Save final experiment summary and progress plot."""
-        print("Saving Experiment Summary...")
+        self.logger.info("Saving experiment summary...")
         
         summary = {
             "experiment_name": self.experiment_name,
@@ -312,17 +328,24 @@ class ParallelExperimentRunner:
         4. Save experiment summary
         5. Shutdown worker pool
         """
-        print(f"Starting Parallel Experiment: {self.experiment_name}")
+        self.logger.info("Starting Parallel Experiment: %s", self.experiment_name)
         
         # Detect available workers
         if self.n_workers is None:
             self.n_workers = get_available_workers()
         
-        print(f"Configuration: Population={self.pop_size}, Generations={self.generations}, "
-              f"Workers={self.n_workers}")
+        self.logger.info(
+            "Configuration: Population=%d  Generations=%d  Workers=%d  "
+            "CX=%.2f  MUT=%.2f  batch_size=%d",
+            self.pop_size, self.generations, self.n_workers,
+            self.cx_prob, self.mut_prob, self.batch_size)
+        
+        # Start heartbeat (writes alive signal every 60s)
+        start_heartbeat(interval=60, log_dir=self.base_dir, include_memory=True)
         
         # Initialize population (main process)
         pop = self.toolbox.population(n=self.pop_size)
+        self.logger.info("Initial population created (%d individuals)", len(pop))
         
         # Create parallel evaluator
         self.evaluator = ParallelEvaluator(
@@ -337,28 +360,28 @@ class ParallelExperimentRunner:
             n_workers=self.n_workers
         )
         
+        experiment_start = time.time()
+        
         try:
             # Evaluate Generation 0
-            print("\n=== Generation 0 ===")
-            start_time = time.time()
+            self.logger.info("\n=== Generation 0 ===")
             
-            results = self.evaluator.evaluate_population(pop, 0, self.base_dir)
-            self._apply_results_to_population(pop, results)
-            self.save_generation(pop, 0)
-            
-            gen_time = time.time() - start_time
-            print(f"Generation 0 completed in {gen_time:.2f}s")
+            with TimingContext("Generation 0 evaluation", self.logger):
+                results = self.evaluator.evaluate_population(pop, 0, self.base_dir)
+                self._apply_results_to_population(pop, results)
+                self.save_generation(pop, 0)
             
             # Evolution loop
             for g in range(1, self.generations + 1):
-                print(f"\n=== Generation {g} ===")
-                start_time = time.time()
+                self.logger.info("\n=== Generation %d ===", g)
+                gen_start = time.time()
                 
                 # Selection (main process)
                 offspring = self.toolbox.select(pop, len(pop))
                 offspring = list(map(self.toolbox.clone, offspring))
                 
                 # Crossover (main process)
+                cx_count = 0
                 for child1, child2 in zip(offspring[::2], offspring[1::2]):
                     if np.random.random() < self.cx_prob:
                         self.toolbox.mate(child1, child2)
@@ -368,28 +391,34 @@ class ParallelExperimentRunner:
                             del child1.train_acc
                         if hasattr(child2, "train_acc"): 
                             del child2.train_acc
+                        cx_count += 1
                 
                 # Mutation (main process)
+                mut_count = 0
                 for mutant in offspring:
                     if np.random.random() < self.mut_prob:
                         self.toolbox.mutate(mutant)
                         del mutant.fitness.values
                         if hasattr(mutant, "train_acc"): 
                             del mutant.train_acc
+                        mut_count += 1
                 
                 # Find individuals that need evaluation
                 invalid_indices = [i for i, ind in enumerate(offspring) 
                                    if not ind.fitness.valid]
                 invalid_ind = [offspring[i] for i in invalid_indices]
                 
-                print(f"Evaluating {len(invalid_ind)} individuals...")
+                self.logger.info(
+                    "Gen %d reproduction: %d crossovers, %d mutations, "
+                    "%d need re-evaluation",
+                    g, cx_count, mut_count, len(invalid_ind))
                 
                 if invalid_ind:
-                    # Evaluate only invalid individuals in parallel
-                    results = self.evaluator.evaluate_individuals(
-                        invalid_ind, invalid_indices, g, self.base_dir
-                    )
-                    self._apply_results_to_population(offspring, results)
+                    with TimingContext(f"Generation {g} evaluation", self.logger):
+                        results = self.evaluator.evaluate_individuals(
+                            invalid_ind, invalid_indices, g, self.base_dir
+                        )
+                        self._apply_results_to_population(offspring, results)
                 
                 # Copy over results for individuals that weren't re-evaluated
                 for i, ind in enumerate(offspring):
@@ -415,15 +444,29 @@ class ParallelExperimentRunner:
                 pop[:] = offspring
                 self.save_generation(pop, g)
                 
-                gen_time = time.time() - start_time
-                print(f"Generation {g} completed in {gen_time:.2f}s")
+                gen_time = time.time() - gen_start
+                self.logger.info("Generation %d completed in %.2fs", g, gen_time)
             
             # Save final summary
+            total_time = time.time() - experiment_start
+            self.logger.info("Experiment completed in %.2fs (%.1f min)",
+                             total_time, total_time / 60)
             self.save_experiment_summary()
-            print("\nExperiment Completed Successfully.")
+            self.logger.info("Experiment Completed Successfully.")
+            
+        except Exception as exc:
+            self.logger.critical("Experiment CRASHED", exc_info=True)
+            log_memory(label="crash", logger=self.logger)
+            # Still try to save what we have
+            try:
+                self.save_experiment_summary()
+            except Exception:
+                self.logger.error("Failed to save summary after crash", exc_info=True)
+            raise
             
         finally:
-            # Always cleanup the pool
+            # Always cleanup the pool and heartbeat
+            stop_heartbeat()
             if self.evaluator:
                 self.evaluator.shutdown()
 
