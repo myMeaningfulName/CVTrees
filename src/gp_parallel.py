@@ -467,7 +467,7 @@ class ParallelEvaluator:
                  X_test: np.ndarray, y_test: np.ndarray,
                  batch_size: int, pset_context: Dict,
                  n_workers: Optional[int] = None,
-                 task_timeout: int = 1800):
+                 task_timeout: int = 10800):
         """
         Initialize the parallel evaluator with a process pool.
         
