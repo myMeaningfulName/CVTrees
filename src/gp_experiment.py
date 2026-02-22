@@ -50,6 +50,10 @@ class ExperimentRunner:
         """
         Creates a factory for an iterator that yields Batches of images.
         X is expected to be (N, 3, H, W).
+        
+        Always normalizes to [0, 1] float32 so that downstream filters and
+        feature extractors (histogram, color_histogram, etc.) operate on a
+        consistent range.
         """
         batch_size = self.batch_size
         def iterator():
@@ -58,9 +62,14 @@ class ExperimentRunner:
                 batch_data = X[i:i+batch_size]
                 # gp_ops expects List[np.ndarray] for channels [R, G, B]
                 # batch_data is (B, 3, H, W)
-                r = batch_data[:, 0, :, :]
-                g = batch_data[:, 1, :, :]
-                b = batch_data[:, 2, :, :]
+                r = batch_data[:, 0, :, :].astype(np.float32)
+                g = batch_data[:, 1, :, :].astype(np.float32)
+                b = batch_data[:, 2, :, :].astype(np.float32)
+                # Normalize to [0, 1] if data is in [0, 255] range
+                if r.max() > 1.0:
+                    r = r / 255.0
+                    g = g / 255.0
+                    b = b / 255.0
                 yield gp_types.Batch([r, g, b])
         return iterator
 

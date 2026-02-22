@@ -168,14 +168,23 @@ def _make_image_iterator_worker(X: np.ndarray, batch_size: int):
     """
     Creates a factory for an iterator that yields Batches of images.
     Worker-local version that doesn't depend on any instance state.
+    
+    Always normalizes to [0, 1] float32 so that downstream filters and
+    feature extractors (histogram, color_histogram, etc.) operate on a
+    consistent range.
     """
     def iterator():
         n_samples = len(X)
         for i in range(0, n_samples, batch_size):
             batch_data = X[i:i+batch_size]
-            r = batch_data[:, 0, :, :]
-            g = batch_data[:, 1, :, :]
-            b = batch_data[:, 2, :, :]
+            r = batch_data[:, 0, :, :].astype(np.float32)
+            g = batch_data[:, 1, :, :].astype(np.float32)
+            b = batch_data[:, 2, :, :].astype(np.float32)
+            # Normalize to [0, 1] if data is in [0, 255] range
+            if r.max() > 1.0:
+                r = r / 255.0
+                g = g / 255.0
+                b = b / 255.0
             yield Batch([r, g, b])
     return iterator
 

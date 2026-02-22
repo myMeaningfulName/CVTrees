@@ -278,8 +278,16 @@ def histogram_features(channel: Channel) -> FeatureVector:
     def func(data):
         feats = []
         for img in data:
-            hist, _ = np.histogram(img, bins=256, range=(0, 1))
-            feats.append(hist)
+            flat = img.ravel()
+            lo, hi = float(flat.min()), float(flat.max())
+            if hi <= lo:
+                hi = lo + 1.0  # avoid zero-width range
+            hist, _ = np.histogram(flat, bins=256, range=(lo, hi))
+            hist_sum = hist.sum()
+            if hist_sum > 0:
+                feats.append(hist.astype(np.float32) / hist_sum)
+            else:
+                feats.append(np.zeros(256, dtype=np.float32))
         return np.array(feats)
     return map_batches(channel, func, FeatureVector)
 
@@ -959,8 +967,16 @@ def color_histogram_features(channel: Channel) -> FeatureVector:
     def func(data):
         feats = []
         for img in data:
-            hist, _ = np.histogram(img.ravel(), bins=64, range=(0, 1))
-            feats.append(hist.astype(np.float32) / hist.sum())
+            flat = img.ravel()
+            lo, hi = float(flat.min()), float(flat.max())
+            if hi <= lo:
+                hi = lo + 1.0  # avoid zero-width range
+            hist, _ = np.histogram(flat, bins=64, range=(lo, hi))
+            hist_sum = hist.sum()
+            if hist_sum > 0:
+                feats.append(hist.astype(np.float32) / hist_sum)
+            else:
+                feats.append(np.zeros(64, dtype=np.float32))
         return np.array(feats)
     return map_batches(channel, func, FeatureVector)
 
