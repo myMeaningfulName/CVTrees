@@ -45,7 +45,7 @@ from src.gp_logging import setup_experiment_logging, get_logger, log_memory
 # ---------------------------------------------------------------------------
 # Configuration – tweak these knobs as needed
 # ---------------------------------------------------------------------------
-EXPERIMENT_NAME = "test_parallel_cifar"
+EXPERIMENT_NAME = "test_cifra_ops_params"  # Used for logging and output directory naming
 
 # Controls which primitive set variant is built (mirrors the CRC experiment)
 EXTENDED_OPS    = True      # Include extended GP operations
@@ -59,10 +59,10 @@ BATCH_SIZE      = 32
 MAX_DEPTH       = 5
 
 # Data subset sizes – set to None to use the *full* CIFAR-10 dataset
-SAMPLES_PER_SPLIT = 100    # e.g. 2000 for a quick smoke-test
-VAL_RATIO         = 0.2     # fraction of training data held out for validation
-TEST_RATIO         = 0.2    # we already have a dedicated test batch, this is unused
-                             # when loading the official test set
+SAMPLES_PER_CLASS = 100     # images sampled per class (100 × 10 classes = 1000 total)
+TRAIN_RATIO       = 0.6     # fraction of stratified subset used for training
+VAL_RATIO         = 0.2     # fraction of stratified subset used for validation
+TEST_RATIO        = 0.2     # fraction of stratified subset used for testing
 
 
 # ---------------------------------------------------------------------------
@@ -78,19 +78,36 @@ def _load_cifar_batch(fpath: str):
     return X, y
 
 
-def load_cifar10(samples_per_split=None, val_ratio=0.1):
+def load_cifar10(samples_per_class=None, train_ratio=0.6, val_ratio=0.2, test_ratio=0.2):
     """
-    Load the full CIFAR-10 dataset from the local data directory.
+    Load the CIFAR-10 dataset from the local data directory.
 
-    Uses *all five* training batches (50 000 images) and the official
-    test batch (10 000 images).  Optionally sub-samples each split for
-    faster iteration.
+    Pools *all* training batches and the test batch into a single corpus
+    (60 000 images).  When ``samples_per_class`` is set, a stratified
+    sub-sample of that many images per class is drawn first, then the
+    resulting subset is split into train / val / test according to the
+    given ratios (stratified by label).
+
+    Parameters
+    ----------
+    samples_per_class : int or None
+        Number of images to keep *per class*.  With 10 CIFAR-10 classes
+        the total subset size is ``samples_per_class * 10``.
+        ``None`` means use the full 60 000 images.
+    train_ratio, val_ratio, test_ratio : float
+        Must sum to 1.0.  Fractions of the (possibly sub-sampled) data
+        assigned to training, validation and testing respectively.
 
     Returns
     -------
     X_train, y_train, X_val, y_val, X_test, y_test
         Arrays in (N, C, H, W) format, pixel values in [0, 1].
     """
+    # Sanity-check ratios
+    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, (
+        f"Ratios must sum to 1.0, got {train_ratio + val_ratio + test_ratio:.4f}"
+    )
+
     data_dir = os.path.join(PROJECT_ROOT, "data", "cifar-10-batches-py")
 
     if not os.path.isdir(data_dir):
@@ -102,9 +119,9 @@ def load_cifar10(samples_per_split=None, val_ratio=0.1):
         )
 
     # ------------------------------------------------------------------
-    # 1. Load all training batches
+    # 1. Load all batches (train + test) into one pool
     # ------------------------------------------------------------------
-    print("Loading CIFAR-10 training batches...")
+    print("Loading CIFAR-10 batches...")
     X_parts, y_parts = [], []
     for i in range(1, 6):
         batch_path = os.path.join(data_dir, f"data_batch_{i}")
@@ -113,46 +130,56 @@ def load_cifar10(samples_per_split=None, val_ratio=0.1):
         y_parts.append(y_b)
         print(f"  Loaded data_batch_{i}: {X_b.shape[0]} images")
 
-    X_all_train = np.concatenate(X_parts)
-    y_all_train = np.concatenate(y_parts)
+    X_test_raw, y_test_raw = _load_cifar_batch(os.path.join(data_dir, "test_batch"))
+    X_parts.append(X_test_raw)
+    y_parts.append(y_test_raw)
+    print(f"  Loaded test_batch:   {X_test_raw.shape[0]} images")
+
+    X_all = np.concatenate(X_parts)
+    y_all = np.concatenate(y_parts)
+    print(f"  Total pool: {X_all.shape[0]} images")
 
     # ------------------------------------------------------------------
-    # 2. Load the official test batch
+    # 2. (Optional) Stratified sub-sample – N images per class
     # ------------------------------------------------------------------
-    print("Loading CIFAR-10 test batch...")
-    X_test, y_test = _load_cifar_batch(os.path.join(data_dir, "test_batch"))
-    print(f"  Loaded test_batch: {X_test.shape[0]} images")
+    if samples_per_class is not None:
+        classes = np.unique(y_all)
+        keep_idx = []
+        for cls in classes:
+            cls_idx = np.where(y_all == cls)[0]
+            n_take = min(samples_per_class, len(cls_idx))
+            chosen = np.random.choice(cls_idx, n_take, replace=False)
+            keep_idx.append(chosen)
+        keep_idx = np.concatenate(keep_idx)
+        np.random.shuffle(keep_idx)
+        X_all = X_all[keep_idx]
+        y_all = y_all[keep_idx]
+        print(f"  Sub-sampled to {samples_per_class} per class "
+              f"→ {len(X_all)} images total")
 
     # ------------------------------------------------------------------
-    # 3. (Optional) Sub-sample for faster experiments
+    # 3. Stratified split into train / (val + test)
     # ------------------------------------------------------------------
-    if samples_per_split is not None:
-        n_train_cap = min(samples_per_split, len(X_all_train))
-        n_test_cap  = min(samples_per_split, len(X_test))
+    val_test_ratio = val_ratio + test_ratio
+    X_train, X_tmp, y_train, y_tmp = train_test_split(
+        X_all, y_all,
+        test_size=val_test_ratio,
+        stratify=y_all,
+        random_state=42,
+    )
 
-        idx_train = np.random.choice(len(X_all_train), n_train_cap, replace=False)
-        X_all_train = X_all_train[idx_train]
-        y_all_train = y_all_train[idx_train]
-
-        idx_test = np.random.choice(len(X_test), n_test_cap, replace=False)
-        X_test = X_test[idx_test]
-        y_test = y_test[idx_test]
-
-        print(f"  Sub-sampled to {n_train_cap} train / {n_test_cap} test")
-
-    # ------------------------------------------------------------------
-    # 4. Split training data into train + validation
-    # ------------------------------------------------------------------
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_all_train, y_all_train,
-        test_size=val_ratio,
-        stratify=y_all_train,
+    # Split the remaining chunk into val / test
+    relative_test_ratio = test_ratio / val_test_ratio
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_tmp, y_tmp,
+        test_size=relative_test_ratio,
+        stratify=y_tmp,
         random_state=42,
     )
 
     print(
-        f"Data Loaded.  Train: {X_train.shape}, "
-        f"Val: {X_val.shape}, Test: {X_test.shape}"
+        f"Data ready.  Train: {X_train.shape} | "
+        f"Val: {X_val.shape} | Test: {X_test.shape}"
     )
     return X_train, y_train, X_val, y_val, X_test, y_test
 
@@ -211,8 +238,10 @@ def main():
     # 1. Load Data
     # ------------------------------------------------------------------
     X_train, y_train, X_val, y_val, X_test, y_test = load_cifar10(
-        samples_per_split=SAMPLES_PER_SPLIT,
+        samples_per_class=SAMPLES_PER_CLASS,
+        train_ratio=TRAIN_RATIO,
         val_ratio=VAL_RATIO,
+        test_ratio=TEST_RATIO,
     )
 
     # ------------------------------------------------------------------
