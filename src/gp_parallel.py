@@ -447,7 +447,8 @@ class ParallelEvaluator:
     
     Usage:
         evaluator = ParallelEvaluator(X_train, y_train, X_val, y_val, X_test, y_test,
-                                       batch_size, pset.context, n_workers)
+                                       batch_size, pset.context, n_workers,
+                                       task_timeout=1800)
         results = evaluator.evaluate_population(population, gen_num, output_dir)
         evaluator.shutdown()
     """
@@ -456,7 +457,8 @@ class ParallelEvaluator:
                  X_val: np.ndarray, y_val: np.ndarray,
                  X_test: np.ndarray, y_test: np.ndarray,
                  batch_size: int, pset_context: Dict,
-                 n_workers: Optional[int] = None):
+                 n_workers: Optional[int] = None,
+                 task_timeout: int = 1800):
         """
         Initialize the parallel evaluator with a process pool.
         
@@ -467,19 +469,21 @@ class ParallelEvaluator:
             batch_size: Batch size for evaluation
             pset_context: The primitive set context dictionary for compilation
             n_workers: Number of worker processes (default: auto-detect)
+            task_timeout: Maximum seconds per individual evaluation (default: 1800 = 30 min).
+                          Trees exceeding this are marked as failed and skipped.
         """
         self.logger = get_logger("evaluator")
         self.n_workers = n_workers if n_workers else get_available_workers()
+        self.task_timeout = task_timeout
         
-        self.logger.info("Creating process pool with %d workers", self.n_workers)
+        # Store init args so we can recreate the pool if needed
+        self._init_args = (X_train, y_train, X_val, y_val, X_test, y_test,
+                           batch_size, pset_context)
         
-        # Create pool with initializer
-        self.pool = Pool(
-            processes=self.n_workers,
-            initializer=_init_worker,
-            initargs=(X_train, y_train, X_val, y_val, X_test, y_test,
-                      batch_size, pset_context)
-        )
+        self.logger.info("Creating process pool with %d workers  |  task_timeout=%ds",
+                         self.n_workers, self.task_timeout)
+        
+        self._create_pool()
         
         self.batch_size = batch_size
         
@@ -487,10 +491,22 @@ class ParallelEvaluator:
         self._worker_pids: List[int] = []
         self.logger.info("Process pool created successfully")
     
+    def _create_pool(self):
+        """Create (or recreate) the process pool."""
+        self.pool = Pool(
+            processes=self.n_workers,
+            initializer=_init_worker,
+            initargs=self._init_args,
+            maxtasksperchild=1,  # Prevent memory leaks — worker replaced after each task
+        )
+    
     def evaluate_population(self, population: List, gen_num: int,
                            base_output_dir: str) -> List[EvaluationResult]:
         """
         Evaluate an entire population in parallel.
+        
+        Uses apply_async with per-task timeout polling to avoid deadlocks
+        when worker processes die (e.g. OOM-killed by the OS).
         
         Args:
             population: List of DEAP individuals
@@ -515,44 +531,144 @@ class ParallelEvaluator:
             )
             tasks.append(task)
         
-        self.logger.info("Submitting %d evaluation tasks for gen %d", len(tasks), gen_num)
+        self.logger.info("Submitting %d evaluation tasks for gen %d  |  timeout=%ds",
+                         len(tasks), gen_num, self.task_timeout)
         log_memory(label=f"pre-eval-gen{gen_num}", logger=self.logger)
         
         pop_start = time.time()
         
-        # Use imap_unordered for better load balancing
-        results_dict = {}
+        # Submit all tasks asynchronously (instead of imap_unordered)
+        async_results = []
+        for task in tasks:
+            ar = self.pool.apply_async(evaluate_individual_worker, (task,))
+            async_results.append((task.individual_idx, ar, time.time()))
+        
+        # Poll for results with per-task timeout
+        results_dict: Dict[int, EvaluationResult] = {}
         completed = 0
         failed = 0
-        for result in self.pool.imap_unordered(evaluate_individual_worker, tasks):
-            results_dict[result.individual_idx] = result
-            completed += 1
+        timed_out = 0
+        pending = list(range(len(async_results)))
+        pool_broken = False
+        
+        while pending:
+            still_pending = []
+            progress_made = False
             
-            # Collect worker PIDs for memory monitoring
-            # (worker_pid is stored in the results.json by workers)
+            for i in pending:
+                idx, ar, submit_time = async_results[i]
+                elapsed = time.time() - submit_time
+                
+                if ar.ready():
+                    # Task finished (success or exception inside worker)
+                    try:
+                        result = ar.get(timeout=0)
+                    except Exception as e:
+                        # Worker process crashed (segfault, OOM kill, etc.)
+                        self.logger.error(
+                            "[WORKER CRASH] Tree %d: worker died  |  %s: %s",
+                            idx, type(e).__name__, str(e)[:200])
+                        result = EvaluationResult(
+                            individual_idx=idx,
+                            train_acc=0.0, val_acc=0.0, test_acc=0.0,
+                            success=False,
+                            error_msg=f"Worker process crashed: {type(e).__name__}: {e}"
+                        )
+                    
+                    results_dict[idx] = result
+                    completed += 1
+                    progress_made = True
+                    
+                    if result.success:
+                        self.logger.info(
+                            "[%d/%d] Tree %d: train=%.4f  val=%.4f  test=%.4f",
+                            completed, len(tasks), result.individual_idx,
+                            result.train_acc, result.val_acc, result.test_acc)
+                    else:
+                        failed += 1
+                        self.logger.error(
+                            "[%d/%d] Tree %d: FAILED  |  %s",
+                            completed, len(tasks), result.individual_idx,
+                            (result.error_msg or "")[:300])
+                
+                elif elapsed > self.task_timeout:
+                    # Task exceeded timeout — mark as failed
+                    timed_out += 1
+                    failed += 1
+                    completed += 1
+                    progress_made = True
+                    result = EvaluationResult(
+                        individual_idx=idx,
+                        train_acc=0.0, val_acc=0.0, test_acc=0.0,
+                        success=False,
+                        error_msg=f"Task timed out after {elapsed:.0f}s (limit={self.task_timeout}s)"
+                    )
+                    results_dict[idx] = result
+                    self.logger.error(
+                        "[%d/%d] Tree %d: TIMED OUT after %.0fs",
+                        completed, len(tasks), idx, elapsed)
+                
+                else:
+                    still_pending.append(i)
             
-            if result.success:
-                self.logger.info(
-                    "[%d/%d] Tree %d: train=%.4f  val=%.4f  test=%.4f",
-                    completed, len(tasks), result.individual_idx,
-                    result.train_acc, result.val_acc, result.test_acc)
-            else:
-                failed += 1
-                self.logger.error(
-                    "[%d/%d] Tree %d: FAILED  |  %s",
-                    completed, len(tasks), result.individual_idx,
-                    (result.error_msg or "")[:300])
+            pending = still_pending
+            
+            if pending:
+                # Check pool health — if all workers are dead, no point waiting
+                try:
+                    alive_workers = sum(
+                        1 for p in self.pool._pool if p.is_alive()
+                    )
+                    if alive_workers == 0 and not pool_broken:
+                        pool_broken = True
+                        self.logger.error(
+                            "ALL pool workers are dead! Failing %d remaining tasks.",
+                            len(pending))
+                        # Fail all remaining tasks
+                        for i in pending:
+                            idx_fail = async_results[i][0]
+                            results_dict[idx_fail] = EvaluationResult(
+                                individual_idx=idx_fail,
+                                train_acc=0.0, val_acc=0.0, test_acc=0.0,
+                                success=False,
+                                error_msg="Pool broken: all workers dead"
+                            )
+                            completed += 1
+                            failed += 1
+                        pending = []
+                except Exception:
+                    pass  # _pool is an internal attribute, may not always work
+                
+                if pending:
+                    time.sleep(10)  # Poll every 10 seconds
         
         pop_elapsed = time.time() - pop_start
         
         self.logger.info(
             "Population eval complete  |  gen=%d  |  %d/%d succeeded  |  "
-            "%d failed  |  %.2fs total",
-            gen_num, completed - failed, completed, failed, pop_elapsed)
+            "%d failed  |  %d timed_out  |  %.2fs total",
+            gen_num, completed - failed, len(tasks), failed, timed_out, pop_elapsed)
         log_memory(label=f"post-eval-gen{gen_num}", logger=self.logger)
         
+        # If we had timeouts or worker crashes, recreate the pool to clean up
+        # zombie workers and free resources
+        if timed_out > 0 or pool_broken:
+            self.logger.warning(
+                "Recreating pool due to %d timeouts / broken=%s",
+                timed_out, pool_broken)
+            try:
+                self.pool.terminate()
+                self.pool.join()
+            except Exception as e:
+                self.logger.error("Error terminating old pool: %s", e)
+            self._create_pool()
+            self.logger.info("Pool recreated successfully")
+        
         # Return results in original order
-        results = [results_dict[i] for i in range(len(population))]
+        results = [results_dict.get(i, EvaluationResult(
+            individual_idx=i, train_acc=0.0, val_acc=0.0, test_acc=0.0,
+            success=False, error_msg="Result missing (worker lost)"
+        )) for i in range(len(population))]
         return results
     
     def evaluate_individuals(self, individuals: List, indices: List[int],
@@ -584,32 +700,89 @@ class ParallelEvaluator:
             )
             tasks.append(task)
         
-        self.logger.info("Submitting %d partial evaluation tasks for gen %d",
-                         len(tasks), gen_num)
+        self.logger.info("Submitting %d partial evaluation tasks for gen %d  |  timeout=%ds",
+                         len(tasks), gen_num, self.task_timeout)
         
         partial_start = time.time()
         
-        # Collect results
+        # Submit all tasks asynchronously
+        async_results = []
+        for task in tasks:
+            ar = self.pool.apply_async(evaluate_individual_worker, (task,))
+            async_results.append((task.individual_idx, ar, time.time()))
+        
+        # Poll for results with per-task timeout
         results = []
         failed = 0
-        for result in self.pool.imap_unordered(evaluate_individual_worker, tasks):
-            results.append(result)
-            if result.success:
-                self.logger.info(
-                    "Tree %d: train=%.4f  val=%.4f  test=%.4f",
-                    result.individual_idx,
-                    result.train_acc, result.val_acc, result.test_acc)
-            else:
-                failed += 1
-                self.logger.error(
-                    "Tree %d: FAILED  |  %s",
-                    result.individual_idx,
-                    (result.error_msg or "")[:300])
+        timed_out = 0
+        pending = list(range(len(async_results)))
+        
+        while pending:
+            still_pending = []
+            
+            for i in pending:
+                idx, ar, submit_time = async_results[i]
+                elapsed = time.time() - submit_time
+                
+                if ar.ready():
+                    try:
+                        result = ar.get(timeout=0)
+                    except Exception as e:
+                        result = EvaluationResult(
+                            individual_idx=idx,
+                            train_acc=0.0, val_acc=0.0, test_acc=0.0,
+                            success=False,
+                            error_msg=f"Worker process crashed: {type(e).__name__}: {e}"
+                        )
+                    
+                    results.append(result)
+                    if result.success:
+                        self.logger.info(
+                            "Tree %d: train=%.4f  val=%.4f  test=%.4f",
+                            result.individual_idx,
+                            result.train_acc, result.val_acc, result.test_acc)
+                    else:
+                        failed += 1
+                        self.logger.error(
+                            "Tree %d: FAILED  |  %s",
+                            result.individual_idx,
+                            (result.error_msg or "")[:300])
+                
+                elif elapsed > self.task_timeout:
+                    timed_out += 1
+                    failed += 1
+                    result = EvaluationResult(
+                        individual_idx=idx,
+                        train_acc=0.0, val_acc=0.0, test_acc=0.0,
+                        success=False,
+                        error_msg=f"Task timed out after {elapsed:.0f}s (limit={self.task_timeout}s)"
+                    )
+                    results.append(result)
+                    self.logger.error(
+                        "Tree %d: TIMED OUT after %.0fs", idx, elapsed)
+                
+                else:
+                    still_pending.append(i)
+            
+            pending = still_pending
+            if pending:
+                time.sleep(10)
         
         partial_elapsed = time.time() - partial_start
         self.logger.info(
-            "Partial eval complete  |  gen=%d  |  %d tasks  |  %d failed  |  %.2fs",
-            gen_num, len(tasks), failed, partial_elapsed)
+            "Partial eval complete  |  gen=%d  |  %d tasks  |  %d failed  |  "
+            "%d timed_out  |  %.2fs",
+            gen_num, len(tasks), failed, timed_out, partial_elapsed)
+        
+        # Recreate pool if we had timeouts
+        if timed_out > 0:
+            self.logger.warning("Recreating pool due to %d timeouts", timed_out)
+            try:
+                self.pool.terminate()
+                self.pool.join()
+            except Exception as e:
+                self.logger.error("Error terminating old pool: %s", e)
+            self._create_pool()
         
         return results
     

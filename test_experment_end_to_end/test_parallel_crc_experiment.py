@@ -22,7 +22,7 @@ import shutil
 import cv2
 
 # Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src import gp_setup
 from src.gp_experiment_parallel import run_parallel_experiment
@@ -184,14 +184,14 @@ def main():
         X_test=X_test,
         y_test=y_test,
         pset=pset,
-        pop_size=3,       # Default from test_crc_experiment was 10, increased slightly for better parallel utilization example
-        generations=2,    # Default from test_crc_experiment
+        pop_size=9,       # Default from test_crc_experiment was 10, increased slightly for better parallel utilization example
+        generations=3,    # Default from test_crc_experiment
         crossover_prob=0.5,
         mutation_prob=0.2,
         batch_size=32,
         n_workers=n_workers,  # Or None for auto-detect
         output_dir="experiments",
-        max_depth=20      # Extended max depth
+        max_depth=5      # Extended max depth
     )
     
     # Print results

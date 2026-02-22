@@ -424,6 +424,12 @@ def concat_features_4(f1: FeatureVector, f2: FeatureVector, f3: FeatureVector, f
 
 # --- Classification Heads (Stateful) ---
 
+def _sanitize_features(X: np.ndarray) -> np.ndarray:
+    """Replace NaN/Inf values in feature matrices to prevent sklearn errors."""
+    if not np.isfinite(X).all():
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    return X
+
 def rf_classification(features: FeatureVector, t: Trees, d: Depth) -> Prediction:
     node_id = context.get_next_node_id()
     
@@ -433,7 +439,7 @@ def rf_classification(features: FeatureVector, t: Trees, d: Depth) -> Prediction
             for batch in features:
                 X_list.append(batch.data)
             if not X_list: return
-            X = np.vstack(X_list)
+            X = _sanitize_features(np.vstack(X_list))
             y = context.train_labels
             
             clf = RandomForestClassifier(n_estimators=t, max_depth=d, n_jobs=1)
@@ -450,7 +456,7 @@ def rf_classification(features: FeatureVector, t: Trees, d: Depth) -> Prediction
             clf = context.get_model(node_id)
             if clf:
                 for batch in features:
-                    yield Batch(clf.predict_proba(batch.data))
+                    yield Batch(clf.predict_proba(_sanitize_features(batch.data)))
             else:
                 for batch in features:
                     yield Batch(np.zeros((batch.data.shape[0], 10)))
@@ -466,7 +472,7 @@ def erf_classification(features: FeatureVector, t: Trees, d: Depth) -> Predictio
             for batch in features:
                 X_list.append(batch.data)
             if not X_list: return
-            X = np.vstack(X_list)
+            X = _sanitize_features(np.vstack(X_list))
             y = context.train_labels
             
             clf = ExtraTreesClassifier(n_estimators=t, max_depth=d, n_jobs=1)
@@ -483,7 +489,7 @@ def erf_classification(features: FeatureVector, t: Trees, d: Depth) -> Predictio
             clf = context.get_model(node_id)
             if clf:
                 for batch in features:
-                    yield Batch(clf.predict_proba(batch.data))
+                    yield Batch(clf.predict_proba(_sanitize_features(batch.data)))
             else:
                 for batch in features:
                     yield Batch(np.zeros((batch.data.shape[0], 10)))
@@ -499,7 +505,7 @@ def lr_classification(features: FeatureVector) -> Prediction:
             for batch in features:
                 X_list.append(batch.data)
             if not X_list: return
-            X = np.vstack(X_list)
+            X = _sanitize_features(np.vstack(X_list))
             y = context.train_labels
             
             clf = LogisticRegression(max_iter=1000)
@@ -516,7 +522,7 @@ def lr_classification(features: FeatureVector) -> Prediction:
             clf = context.get_model(node_id)
             if clf:
                 for batch in features:
-                    yield Batch(clf.predict_proba(batch.data))
+                    yield Batch(clf.predict_proba(_sanitize_features(batch.data)))
             else:
                 for batch in features:
                     yield Batch(np.zeros((batch.data.shape[0], 10)))
@@ -532,7 +538,7 @@ def svm_classification(features: FeatureVector) -> Prediction:
             for batch in features:
                 X_list.append(batch.data)
             if not X_list: return
-            X = np.vstack(X_list)
+            X = _sanitize_features(np.vstack(X_list))
             y = context.train_labels
             
             clf = SVC(probability=True)
@@ -549,7 +555,7 @@ def svm_classification(features: FeatureVector) -> Prediction:
             clf = context.get_model(node_id)
             if clf:
                 for batch in features:
-                    yield Batch(clf.predict_proba(batch.data))
+                    yield Batch(clf.predict_proba(_sanitize_features(batch.data)))
             else:
                 print(f"WARNING: SVM Model not found for node {node_id} in EVAL mode.")
                 for batch in features:
@@ -572,12 +578,29 @@ def ensemble_single(p: Prediction) -> EnsembleOutput:
             yield Batch(batch.data)
     return EnsembleOutput(iterator_factory)
 
+def _pad_predictions_to_match(*arrays):
+    """Pad prediction arrays to the same number of columns (classes).
+    
+    Different classifiers may see different numbers of classes in different
+    cross-validation folds or batches, producing arrays with different column
+    counts. This pads with zeros so they can be summed safely.
+    """
+    max_cols = max(a.shape[1] for a in arrays)
+    result = []
+    for a in arrays:
+        if a.shape[1] < max_cols:
+            pad_width = ((0, 0), (0, max_cols - a.shape[1]))
+            a = np.pad(a, pad_width, mode='constant', constant_values=0.0)
+        result.append(a)
+    return result
+
 def ensemble_sum_2(p1: Prediction, p2: Prediction) -> EnsembleOutput:
     """
     Sums two classifiers' predictions and produces the final ensemble output.
     This is the ensemble summation layer.
     """
     def func(d1, d2):
+        d1, d2 = _pad_predictions_to_match(d1, d2)
         return d1 + d2
     return map_batches_2(p1, p2, func, EnsembleOutput)
 
@@ -587,6 +610,7 @@ def ensemble_sum_3(p1: Prediction, p2: Prediction, p3: Prediction) -> EnsembleOu
     This is the ensemble summation layer.
     """
     def func(d1, d2, d3):
+        d1, d2, d3 = _pad_predictions_to_match(d1, d2, d3)
         return d1 + d2 + d3
     return map_batches_3(p1, p2, p3, func, EnsembleOutput)
 
@@ -597,12 +621,14 @@ def ensemble_sum_3(p1: Prediction, p2: Prediction, p3: Prediction) -> EnsembleOu
 def sum_prediction_2(p1: Prediction, p2: Prediction) -> Prediction:
     """DEPRECATED: Use ensemble_sum_2 instead. This allows illegal nested summations."""
     def func(d1, d2):
+        d1, d2 = _pad_predictions_to_match(d1, d2)
         return d1 + d2
     return map_batches_2(p1, p2, func, Prediction)
 
 def sum_prediction_3(p1: Prediction, p2: Prediction, p3: Prediction) -> Prediction:
     """DEPRECATED: Use ensemble_sum_3 instead. This allows illegal nested summations."""
     def func(d1, d2, d3):
+        d1, d2, d3 = _pad_predictions_to_match(d1, d2, d3)
         return d1 + d2 + d3
     return map_batches_3(p1, p2, p3, func, Prediction)
 
